@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # 初始化设备、模型和匹配器
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 ransac_kwargs = {'ransac_reproj_thresh': 2, 'ransac_conf': 0.99, 'ransac_iters': 2000}
-matcher = get_matcher(['minima-splg'], device=device, **ransac_kwargs)
+matcher = get_matcher(['minima-roma'], device=device, **ransac_kwargs)
 rotation_steps = 9
 rotation_angle_step = 360 / rotation_steps
 
