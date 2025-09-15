@@ -49,7 +49,21 @@ class BaseMatcher(torch.nn.Module):
     def load_image(path: str | Path, resize: int | Tuple = None, rot_angle: float = 0) -> torch.Tensor:
         if isinstance(resize, int):
             resize = (resize, resize)
-        img = tfm.ToTensor()(Image.open(path).convert("RGB"))
+        # img = tfm.ToTensor()(Image.open(path).convert("RGB")) # 原版
+        ########我修改的版本start,支持传入路径和cv2/Image读取的文件#########
+        if isinstance(path, (str, Path)):
+            # 传入的是图像路径，使用 Image.open
+            img = Image.open(path).convert("RGB")
+        elif isinstance(path, np.ndarray):
+            # 传入的是 cv2 读取的图像结果
+            img = Image.fromarray(cv2.cvtColor(path, cv2.COLOR_BGR2RGB))  # cv2 读取的是 BGR 格式，需要转换为 RGB
+        elif isinstance(path, Image.Image) and img.mode != 'RGB':
+            # 传入的是 PIL 图像对象
+            img = path.convert("RGB")
+        else:
+            raise TypeError("Unsupported input type")
+        img = tfm.ToTensor()(img)
+        ########我修改的版本end#########
         if resize is not None:
             img = tfm.Resize(resize, antialias=True)(img)
         img = tfm.functional.rotate(img, rot_angle)
