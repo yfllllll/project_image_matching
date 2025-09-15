@@ -46,7 +46,7 @@ class MINIMAMatcher(BaseMatcher):
         self.download_weights()
 
     def download_weights(self):
-        if not Path(self.weights_src).is_file():
+        if not Path(self.model_path).is_file():
             print(f"Downloading MINIMA {self.model_type}...")
             py3_wget.download_file(self.weights_src, self.model_path)
 
