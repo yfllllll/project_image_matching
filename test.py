@@ -11,11 +11,138 @@ from rasterio.transform import from_origin
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional, Tuple
 import torch
-import logging
 import traceback
 from poslocation.Coarse_img import SmartImage
 from matching.viz import *
 from matching import get_matcher
+import logging  
+from enum import Enum  
+from contextlib import contextmanager
+import time
+
+
+class ErrorType(Enum):  
+    VALIDATION_ERROR = "validation_error"  
+    PROCESSING_ERROR = "processing_error"  
+    RESOURCE_ERROR = "resource_error"  
+    SYSTEM_ERROR = "system_error"  
+  
+# 配置更详细的日志  
+logging.basicConfig(  
+    level=logging.INFO,  
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',  
+    handlers=[  
+        logging.FileHandler('geolocation_service.log'),  
+        logging.StreamHandler()  
+    ]  
+)  
+logger = logging.getLogger(__name__)  
+  
+class GeoLocationError(Exception):  
+    def __init__(self, error_type: ErrorType, message: str, details: dict = None):  
+        self.error_type = error_type  
+        self.message = message  
+        self.details = details or {}  
+        super().__init__(self.message)
+
+
+@contextmanager  
+def temporary_file(suffix=".jpg"):  
+    """安全的临时文件管理器"""  
+    tmp_file = None  
+    try:  
+        tmp_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)  
+        yield tmp_file  
+    finally:  
+        if tmp_file and os.path.exists(tmp_file.name):  
+            try:  
+                os.unlink(tmp_file.name)  
+                logger.info(f"清理临时文件: {tmp_file.name}")  
+            except Exception as e:  
+                logger.warning(f"清理临时文件失败: {e}")
+
+
+
+
+from fastapi import HTTPException, status  
+import magic  
+  
+# 文件验证配置  
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB  
+ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/tiff']  
+ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.tif', '.tiff']  
+  
+def validate_image_file(file: UploadFile) -> None:  
+    """验证上传的图像文件"""  
+    # 检查文件扩展名  
+    if not any(file.filename.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS):  
+        raise GeoLocationError(  
+            ErrorType.VALIDATION_ERROR,  
+            f"不支持的文件格式。支持的格式: {', '.join(ALLOWED_EXTENSIONS)}"  
+        )  
+      
+    # 检查文件大小（需要先读取内容）  
+    file_content = file.file.read()  
+    file.file.seek(0)  # 重置文件指针  
+      
+    if len(file_content) > MAX_FILE_SIZE:  
+        raise GeoLocationError(  
+            ErrorType.VALIDATION_ERROR,  
+            f"文件大小超过限制 ({MAX_FILE_SIZE / 1024 / 1024:.1f}MB)"  
+        )  
+      
+    # 检查MIME类型  
+    mime_type = magic.from_buffer(file_content, mime=True)  
+    if mime_type not in ALLOWED_MIME_TYPES:  
+        raise GeoLocationError(  
+            ErrorType.VALIDATION_ERROR,  
+            f"不支持的文件类型: {mime_type}"  
+        )  
+  
+def validate_points(points_str: str) -> List[Tuple[int, int]]:  
+    """验证点坐标格式"""  
+    if not points_str:  
+        return []  
+      
+    try:  
+        points = json.loads(points_str)  
+        if not isinstance(points, list):  
+            raise ValueError("点坐标必须是数组格式")  
+          
+        validated_points = []  
+        for i, point in enumerate(points):  
+            if not isinstance(point, (list, tuple)) or len(point) != 2:  
+                raise ValueError(f"第{i+1}个点坐标格式错误，应为[x, y]格式")  
+              
+            x, y = point  
+            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):  
+                raise ValueError(f"第{i+1}个点坐标值必须是数字")  
+              
+            if x < 0 or y < 0 or x > 10000 or y > 10000:  
+                raise ValueError(f"第{i+1}个点坐标超出合理范围")  
+              
+            validated_points.append((int(x), int(y)))  
+          
+        return validated_points  
+    except json.JSONDecodeError:  
+        raise GeoLocationError(  
+            ErrorType.VALIDATION_ERROR,  
+            "点坐标JSON格式错误"  
+        )  
+    except ValueError as e:  
+        raise GeoLocationError(  
+            ErrorType.VALIDATION_ERROR,  
+            str(e)  
+        )
+
+
+
+
+
+
+
+
+
 # 初始化服务
 app = FastAPI(
     title="地理定位服务 API",
@@ -30,7 +157,7 @@ logger = logging.getLogger(__name__)
 # 初始化设备、模型和匹配器
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 ransac_kwargs = {'ransac_reproj_thresh': 2, 'ransac_conf': 0.99, 'ransac_iters': 2000}
-matcher = get_matcher(['minima-roma'], device=device, **ransac_kwargs)
+matcher = get_matcher(['minima-sp_lg'], device=device, **ransac_kwargs)
 rotation_steps = 9
 rotation_angle_step = 360 / rotation_steps
 
@@ -243,97 +370,139 @@ def convert_numpy_to_list(obj, special_keys=None):
         return obj
 # ====== 服务端点 ======
 
-@app.post("/geolocate", response_model=GeoLocationResponse)
-async def geolocate_endpoint(
-    drone_image: UploadFile = File(..., description="无人机图像文件"),
-    tile_dir: str = Form(..., description="遥感影像目录"),
-    points: str = Form(None, description="JSON格式的点坐标列表"),
-    top_k: int = Form(1, description="返回前K个匹配结果")
-):
-    """
-    地理定位服务端点
-    
-    使用场景: 
-    用户有无人机影像、参考遥感影像数据集和若干像素坐标点，
-    希望一次性完成定位并将像素坐标转换为地理坐标
-    
-    返回:
-    - location_params: 定位参数列表
-    - transformed_points: 转换后的坐标点（如果提供了点坐标）
-    """
-    try:
-        # 读取无人机图像
-        image_data = await drone_image.read()
-        logger.info(f"收到地理定位请求，图像大小: {len(image_data)}字节")
-        
-        # 创建临时文件
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            tmp.write(image_data)
-            drone_image_path = tmp.name
-        
-        # 解析点坐标
-        point_list = []
-        if points:
-            try:
-                point_list = json.loads(points)
-                if not isinstance(point_list, list) or not all(len(p) == 2 for p in point_list):
-                    raise ValueError("点坐标格式无效")
-                logger.info(f"解析到 {len(point_list)} 个点坐标")
-            except Exception as e:
-                logger.warning(f"点坐标解析失败: {str(e)}")
-                point_list = []
-        
-        # 核心定位逻辑 - 保持您的原始实现
-        location_results = locate(drone_image_path, tile_dir, top_k)
-        
-        # 处理定位结果
-        location_params = []
-        for result in location_results:
-            homography = result["homography"].tolist() if isinstance(result["homography"], np.ndarray) else result["homography"]
-            transform = [
-                result["transform"].a, result["transform"].b, 
-                result["transform"].c, result["transform"].d,
-                result["transform"].e, result["transform"].f
-            ]
-            info_for_project_point_to_orthoimage = convert_numpy_to_list(result.get("info_for_project_point_to_orthoimage"))
-            param = LocationParam(
-                ref_image=result["ref_image"],
-                homography=homography,
-                transform=transform,
-                crs_src=result["crs_src"],
-                info_for_project_point_to_orthoimage=info_for_project_point_to_orthoimage
-            )
-            location_params.append(param)
-        
-        # 准备响应数据
-        response_data = {
-            "status": "success",
-            "location_params": location_params,
-            "metadata": {
-                "filename": drone_image.filename,
-                "size": len(image_data),
-                "top_k": top_k,
-                "tile_dir": tile_dir
-            }
-        }
-        
-        # 如果提供了点坐标，直接转换并返回
-        if point_list:
-            logger.info(f"请求中包含 {len(point_list)} 个点坐标，直接转换")
-            transformed = await transform_points(location_params, point_list)
-            response_data["transformed_points"] = transformed
-        
-        # 清理临时文件
-        if os.path.exists(drone_image_path):
-            os.unlink(drone_image_path)
-            
-        return response_data
-    
-    except Exception as e:
-        logger.error(f"地理定位失败: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail={"status": "error", "message": f"地理定位失败: {str(e)}"}
+@app.post("/geolocate", response_model=GeoLocationResponse)  
+async def geolocate_endpoint(  
+    drone_image: UploadFile = File(..., description="无人机图像文件"),  
+    tile_dir: str = Form(..., description="遥感影像目录"),  
+    points: str = Form(None, description="JSON格式的点坐标列表"),  
+    top_k: int = Form(1, description="返回前K个匹配结果")  
+):  
+    """增强的地理定位服务端点"""  
+    request_id = f"req_{int(time.time() * 1000)}"  
+    logger.info(f"[{request_id}] 收到地理定位请求")  
+      
+    try:  
+        # 1. 输入验证  
+        validate_image_file(drone_image)  
+          
+        if not os.path.exists(tile_dir):  
+            raise GeoLocationError(  
+                ErrorType.VALIDATION_ERROR,  
+                f"遥感影像目录不存在: {tile_dir}"  
+            )  
+          
+        if top_k < 1 or top_k > 10:  
+            raise GeoLocationError(  
+                ErrorType.VALIDATION_ERROR,  
+                "top_k参数必须在1-10之间"  
+            )  
+          
+        point_list = validate_points(points)  
+        logger.info(f"[{request_id}] 验证通过，包含{len(point_list)}个点坐标")  
+          
+        # 2. 安全的文件处理  
+        with temporary_file(suffix=".jpg") as tmp_file:  
+            image_data = await drone_image.read()  
+            tmp_file.write(image_data)  
+            tmp_file.flush()  
+              
+            logger.info(f"[{request_id}] 图像保存到临时文件: {tmp_file.name}")  
+              
+            # 3. 核心定位逻辑（添加超时控制）  
+            try:  
+                location_results = await asyncio.wait_for(  
+                    asyncio.to_thread(locate, tmp_file.name, tile_dir, top_k),  
+                    timeout=300  # 5分钟超时  
+                )  
+            except asyncio.TimeoutError:  
+                raise GeoLocationError(  
+                    ErrorType.PROCESSING_ERROR,  
+                    "地理定位处理超时"  
+                )  
+              
+            if not location_results:  
+                raise GeoLocationError(  
+                    ErrorType.PROCESSING_ERROR,  
+                    "未找到匹配的参考图像"  
+                )  
+              
+            # 4. 处理定位结果  
+            location_params = []  
+            for result in location_results:  
+                try:  
+                    param = LocationParam(  
+                        ref_image=result["ref_image"],  
+                        homography=result["homography"].tolist() if isinstance(result["homography"], np.ndarray) else result["homography"],  
+                        transform=[  
+                            result["transform"].a, result["transform"].b,   
+                            result["transform"].c, result["transform"].d,  
+                            result["transform"].e, result["transform"].f  
+                        ],  
+                        crs_src=result["crs_src"],  
+                        info_for_project_point_to_orthoimage=convert_numpy_to_list(  
+                            result.get("info_for_project_point_to_orthoimage")  
+                        )  
+                    )  
+                    location_params.append(param)  
+                except Exception as e:  
+                    logger.warning(f"[{request_id}] 处理定位结果失败: {e}")  
+                    continue  
+              
+            if not location_params:  
+                raise GeoLocationError(  
+                    ErrorType.PROCESSING_ERROR,  
+                    "定位结果处理失败"  
+                )  
+              
+            # 5. 准备响应  
+            response_data = {  
+                "status": "success",  
+                "location_params": location_params,  
+                "metadata": {  
+                    "request_id": request_id,  
+                    "filename": drone_image.filename,  
+                    "size": len(image_data),  
+                    "top_k": top_k,  
+                    "tile_dir": tile_dir,  
+                    "processing_time": time.time()  
+                }  
+            }  
+              
+            # 6. 坐标转换（如果提供了点）  
+            if point_list:  
+                try:  
+                    transformed = await transform_points(location_params, point_list)  
+                    response_data["transformed_points"] = transformed  
+                    logger.info(f"[{request_id}] 成功转换{len(point_list)}个点坐标")  
+                except Exception as e:  
+                    logger.warning(f"[{request_id}] 坐标转换失败: {e}")  
+                    response_data["transform_error"] = str(e)  
+              
+            logger.info(f"[{request_id}] 地理定位完成")  
+            return response_data  
+      
+    except GeoLocationError as e:  
+        logger.error(f"[{request_id}] 地理定位失败: {e.message}")  
+        raise HTTPException(  
+            status_code=400 if e.error_type == ErrorType.VALIDATION_ERROR else 500,  
+            detail={  
+                "status": "error",  
+                "error_type": e.error_type.value,  
+                "message": e.message,  
+                "details": e.details,  
+                "request_id": request_id  
+            }  
+        )  
+    except Exception as e:  
+        logger.error(f"[{request_id}] 系统错误: {str(e)}\n{traceback.format_exc()}")  
+        raise HTTPException(  
+            status_code=500,  
+            detail={  
+                "status": "error",  
+                "error_type": ErrorType.SYSTEM_ERROR.value,  
+                "message": "系统内部错误",  
+                "request_id": request_id  
+            }  
         )
 
 # 修复 TransformRequest 模型定义
@@ -408,7 +577,16 @@ async def transform_points(
             results[point_tuple] = {"error": str(e)}
     
     return results
-
+@app.get("/health")  
+async def health_check():  
+    """服务健康检查"""  
+    return {  
+        "status": "healthy",  
+        "timestamp": time.time(),  
+        "version": "1.3.0",  
+        "device": device,  
+        "cuda_available": torch.cuda.is_available()  
+    }
 # ====== 核心功能函数 ======
 
 def locate(drone_image_path, remote_tile_dir, top_k=1):
@@ -425,6 +603,7 @@ def locate(drone_image_path, remote_tile_dir, top_k=1):
             ref_image = cv2.imread(ref_path)
             H = image_matching(src_image, ref_image, isCameraImg=isCameraImg,resize=resize)
             warped_src, x_min, y_min, H = compute_homography_and_warp_dynamic(src_image, H)
+            
             output_tif_path = os.path.join('tmpdir', f"warped_{os.path.basename(src_path)}.tif")
             transform, crs = save_as_geotiff(warped_src, output_tif_path, ref_path, x_offset=x_min, y_offset=y_min)
             results.append({
@@ -531,7 +710,6 @@ def pixel_to_geo(pixel_xy, entry):
     geo_coords.append((lon, lat))
 
     return geo_coords, projected_points
-
 
 
 if __name__ == "__main__":
