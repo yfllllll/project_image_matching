@@ -11,16 +11,16 @@ from rasterio.transform import from_origin
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional, Tuple
 import torch
+import logging
 import traceback
 from poslocation.Coarse_img import SmartImage
 from matching.viz import *
 from matching import get_matcher
+import time
 import logging  
 from enum import Enum  
-from contextlib import contextmanager
-import time
-
-
+from contextlib import contextmanager  
+import asyncio  
 class ErrorType(Enum):  
     VALIDATION_ERROR = "validation_error"  
     PROCESSING_ERROR = "processing_error"  
@@ -60,9 +60,6 @@ def temporary_file(suffix=".jpg"):
                 logger.info(f"清理临时文件: {tmp_file.name}")  
             except Exception as e:  
                 logger.warning(f"清理临时文件失败: {e}")
-
-
-
 
 from fastapi import HTTPException, status  
 import magic  
@@ -134,14 +131,6 @@ def validate_points(points_str: str) -> List[Tuple[int, int]]:
             ErrorType.VALIDATION_ERROR,  
             str(e)  
         )
-
-
-
-
-
-
-
-
 
 # 初始化服务
 app = FastAPI(
@@ -577,16 +566,7 @@ async def transform_points(
             results[point_tuple] = {"error": str(e)}
     
     return results
-@app.get("/health")  
-async def health_check():  
-    """服务健康检查"""  
-    return {  
-        "status": "healthy",  
-        "timestamp": time.time(),  
-        "version": "1.3.0",  
-        "device": device,  
-        "cuda_available": torch.cuda.is_available()  
-    }
+
 # ====== 核心功能函数 ======
 
 def locate(drone_image_path, remote_tile_dir, top_k=1):
@@ -602,8 +582,9 @@ def locate(drone_image_path, remote_tile_dir, top_k=1):
             src_image = camera_img.get_coarse_tif() if camera_img else cv2.imread(src_path)
             ref_image = cv2.imread(ref_path)
             H = image_matching(src_image, ref_image, isCameraImg=isCameraImg,resize=resize)
+            if H is None:
+                continue
             warped_src, x_min, y_min, H = compute_homography_and_warp_dynamic(src_image, H)
-            
             output_tif_path = os.path.join('tmpdir', f"warped_{os.path.basename(src_path)}.tif")
             transform, crs = save_as_geotiff(warped_src, output_tif_path, ref_path, x_offset=x_min, y_offset=y_min)
             results.append({
@@ -710,6 +691,7 @@ def pixel_to_geo(pixel_xy, entry):
     geo_coords.append((lon, lat))
 
     return geo_coords, projected_points
+
 
 
 if __name__ == "__main__":

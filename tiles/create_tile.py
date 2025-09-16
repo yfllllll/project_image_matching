@@ -1,7 +1,7 @@
 from osgeo import gdal
 import os
 
-def slice_image(input_image_path, output_dir, tile_size_x=1024, tile_size_y=1024, step_size_x=512, step_size_y=512):
+def slice_image(input_image_path, output_dir, tile_size_x=1024, tile_size_y=1024, step_size_x=256, step_size_y=512):
     """
     使用GDAL对遥感影像进行自适应坐标方向的切片，并确保切片的地理坐标与原影像一致。
 
