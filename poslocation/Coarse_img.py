@@ -30,7 +30,7 @@ class CameraImg:
         self.pixel_size = (self.sensor_width / self.image_cols) /1000 #每个像素的大小，单位m
         self.bbox = self.get_boundry()  
         self.get_tif_rows_cols()   
-        
+        # self.createGeoTiff()
         # self.info_for_project_point_to_orthoimage = {
         #         'eo': list(self.info['eo']),  # 强制转列表
         #         'R': self.R.tolist(),         # numpy数组 → 列表
@@ -174,7 +174,7 @@ class SmartImage:
             return top_list, self.camera_img
         else:  
             top_list = self.search_model(self.file_path, remote_sensing_tile_dir,   
-                                     top_k=top_k, gallery_batch_size=256) 
+                                     top_k=top_k, gallery_batch_size=16) 
             return top_list, None 
       
 

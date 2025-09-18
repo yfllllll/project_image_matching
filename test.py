@@ -192,6 +192,11 @@ def image_matching(img0, img1,isCameraImg=False, resize=1024):
             # img0 = source_image.get_coarse_tif()
             # img1 = cv2.imread(target_image)
             # img1_preprocessed = preprocess_image(img1)
+            width, height = img0.shape[1], img0.shape[0]
+            scale = 1.0
+            if width > resize*3 or height > resize*3:
+                scale = max(img0.shape[0], img0.shape[1]) / resize
+                img0 = cv2.resize(img0, None, fx=1/scale, fy=1/scale, interpolation=cv2.INTER_LINEAR)
             img0 = preprocess_image(img0)
             img1 = preprocess_image(img1)   
             result = matcher(img0, img1)
@@ -202,7 +207,13 @@ def image_matching(img0, img1,isCameraImg=False, resize=1024):
             # # 计算每个像素的透明度加权
             # result[0:height, 0:width] = np.where(result[0:height, 0:width] != 0, result[0:height, 0:width], 
             #                                     cv2.addWeighted(result[0:height, 0:width], alpha, img1_t[0:height, 0:width], beta, 0))
-
+            if H is None:
+                return None
+            S1 = np.array([[1/scale, 0, 0],
+              [0, 1/scale, 0],
+              [0, 0, 1]])  # 3x3标准缩放矩阵
+            # S1_inv = np.linalg.inv(S1)
+            H = H @ S1
             return H
             
         else:
@@ -244,6 +255,8 @@ def image_matching(img0, img1,isCameraImg=False, resize=1024):
                 # 提取匹配结果中的内点数和匹配点
                 num_inliers, H, inlier_kpts0, inlier_kpts1, matched_kpts0, matched_kpts1 = result['num_inliers'], result['H'], result['inlier_kpts0'], result['inlier_kpts1'],  result['matched_kpts0'], result['matched_kpts1']
                 # 还原旋转后的匹配点（将旋转后的点恢复到原图像坐标系）
+                if H is None:
+                    continue
                 inlier_kpts0 = add_ones(inlier_kpts0)
                 inlier_kpts0 = (M_inv * inlier_kpts0.T).A.T[:, 0:2]  # 恢复到原图坐标系
                 
@@ -263,6 +276,8 @@ def image_matching(img0, img1,isCameraImg=False, resize=1024):
             all_inlier_kpts1 = np.vstack(all_inlier_kpts1)
 
             # 计算最终的变换矩阵（使用透视变换）
+            if len(all_inlier_kpts0) < 4 or len(all_inlier_kpts1) < 4:
+                return None
             H_final, status = cv2.findHomography(all_inlier_kpts0, all_inlier_kpts1, 
                                                 method = cv2.USAC_MAGSAC,
                                                 ransacReprojThreshold = ransac_kwargs['ransac_reproj_thresh'], 
@@ -271,7 +286,8 @@ def image_matching(img0, img1,isCameraImg=False, resize=1024):
 
             # result = stitch_images_optimized(img0, img1, H_final)
             #对 img0 进行透视变换
-            
+            if H_final is None:
+                return None
             S1 = np.array([[1/scale, 0, 0],
               [0, 1/scale, 0],
               [0, 0, 1]])  # 3x3标准缩放矩阵
@@ -589,7 +605,8 @@ def locate(drone_image_path, remote_tile_dir, top_k=1):
     results = []
     for src_path, ref_paths in match_dict.items():
         for ref_path in ref_paths:
-            resize = 512 if not camera_img else None
+            # resize = 512 if not camera_img else None
+            resize = 1024
             isCameraImg = True if camera_img else False
             # 读取源图像和参考图像
             src_image = camera_img.get_coarse_tif() if camera_img else cv2.imread(src_path)
